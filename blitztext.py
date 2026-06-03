@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-blitztext-linux: push-to-talk speech-to-text for Linux/Wayland
-Rechte Strg halten → Mikro aufnehmen → loslassen → Transkription → Clipboard
+blitztext-linux: push-to-talk Diktat für Linux/Wayland
+
+Hotkeys:
+  AltGr          halten → Blitztext+   (Transkription + KI-Cleanup)   ← Standardfall
+  Win + Strg L   halten → Blitztext    (reine Transkription)
+  Win + Alt L    halten → Blitztext $%&! (sachlich umformulieren)
 
 Backends:
-  Transkription: realtime (GPT-Realtime-Whisper, streaming)
-                 openai   (whisper-1, REST)
-                 local    (faster-whisper, offline)
-  LLM-Rewrite:   openai | openrouter  (optional, für Blitztext+ Modus)
+  TRANSCRIPTION_BACKEND=realtime  → GPT-Realtime-Whisper via OpenAI SDK
+  TRANSCRIPTION_BACKEND=openai    → whisper-1 REST API (Fallback)
+  TRANSCRIPTION_BACKEND=local     → faster-whisper offline
 
-Konfiguration via .env:
-  TRANSCRIPTION_BACKEND=realtime       # realtime | openai | local
-  WHISPER_MODEL=base                   # tiny|base|small|medium|large-v3 (nur local)
-  WHISPER_LANGUAGE=de                  # optional, sonst auto-detect
-  OPENAI_API_KEY=sk-...
-  INPUT_DEVICE=TONOR                   # Teil des Gerätenamens
-  OPENROUTER_API_KEY=sk-or-...
-  LLM_BACKEND=openrouter
-  LLM_MODEL=openai/gpt-4o-mini
+Konfiguration via .env (siehe .env Vorlage)
 """
 
 import os
@@ -26,7 +21,6 @@ import select
 import signal
 import time
 import asyncio
-import json
 import base64
 import threading
 import tempfile
@@ -39,20 +33,23 @@ from evdev import ecodes
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wavfile
-import websockets
 
 
-SAMPLE_RATE = 16_000
-REALTIME_SAMPLE_RATE = 24_000
-_recording_lock = threading.Lock()
-_whisper_model = None
-_noise_floor = 300
+SAMPLE_RATE        = 16_000
+_recording_lock    = threading.Lock()
+_whisper_model     = None
+_noise_floor       = 300
+
+# Hotkey-Definitionen
+KEY_ALTGR   = ecodes.KEY_RIGHTALT
+KEY_WIN     = ecodes.KEY_LEFTMETA
+KEY_LCTRL   = ecodes.KEY_LEFTCTRL
+KEY_LALT    = ecodes.KEY_LEFTALT
 
 HALLUCINATIONS = [
     "amara.org", "untertitel der", "subtitles by", "transcribed by",
     "♪", "www.", ".com", "copyright",
 ]
-
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 
@@ -86,7 +83,121 @@ def calibrate_noise(device, seconds: float = 1.5) -> float:
     return float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
 
 
-# ── Standard-Recorder (openai / local) ───────────────────────────────────────
+# ── Realtime Session (OpenAI SDK) ─────────────────────────────────────────────
+
+class RealtimeSession:
+    """Streamt Audio live zur GPT-Realtime-Whisper API via OpenAI SDK."""
+
+    def __init__(self, api_key: str, language: str | None = None):
+        self._api_key   = api_key
+        self._language  = language
+        self._loop      = asyncio.new_event_loop()
+        self._conn      = None
+        self._stream    = None
+        self._active    = False
+        self._connected = threading.Event()
+        self._done      = threading.Event()
+        self._transcript: str | None = None
+        self._error: str | None = None
+        self._rms_vals: list[float] = []
+
+    def start(self, device=None) -> bool:
+        self._active = True
+        threading.Thread(target=self._run_loop, daemon=True).start()
+        if not self._connected.wait(timeout=8):
+            self._error = "Verbindungs-Timeout zur Realtime API"
+            return False
+        if self._error:
+            return False
+        try:
+            self._stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="int16",
+                device=device, callback=self._audio_cb,
+            )
+            self._stream.start()
+            return True
+        except Exception as e:
+            self._error = str(e)
+            return False
+
+    def _audio_cb(self, indata: np.ndarray, frames, t, status):
+        if not self._active:
+            return
+        chunk = indata.copy()
+        self._rms_vals.append(float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))))
+        if self._conn and self._loop:
+            asyncio.run_coroutine_threadsafe(self._send_chunk(chunk), self._loop)
+
+    async def _send_chunk(self, chunk: np.ndarray):
+        try:
+            await self._conn.input_audio_buffer.append(
+                audio=base64.b64encode(chunk.tobytes()).decode()
+            )
+        except Exception:
+            pass
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._sdk_session())
+        except Exception as e:
+            self._error = str(e)
+            self._connected.set()
+            self._done.set()
+
+    async def _sdk_session(self):
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=self._api_key)
+        transcription_cfg: dict = {"model": "whisper-1"}
+        if self._language:
+            transcription_cfg["language"] = self._language
+        try:
+            async with client.beta.realtime.connect(
+                model="gpt-4o-realtime-preview"
+            ) as conn:
+                self._conn = conn
+                await conn.session.update(session={
+                    "input_audio_format": "pcm16",
+                    "input_audio_transcription": transcription_cfg,
+                    "turn_detection": None,
+                    "modalities": ["text"],
+                    "instructions": "Transcribe exactly what is said.",
+                })
+                self._connected.set()
+                async for event in conn:
+                    kind = event.type
+                    if kind == "conversation.item.input_audio_transcription.completed":
+                        self._transcript = event.transcript.strip()
+                        self._done.set()
+                        return
+                    elif kind == "error":
+                        self._error = str(getattr(event, "error", event))
+                        print(f"Realtime Fehler: {self._error}")
+                        self._done.set()
+                        return
+        except Exception as e:
+            self._error = str(e)
+            self._connected.set()
+            self._done.set()
+
+    def stop(self) -> tuple[str | None, float]:
+        self._active = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        avg_rms = float(np.mean(self._rms_vals)) if self._rms_vals else 0.0
+        if self._conn and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self._conn.input_audio_buffer.commit(), self._loop
+            )
+        self._done.wait(timeout=15)
+        if self._error:
+            raise RuntimeError(self._error)
+        return self._transcript, avg_rms
+
+
+# ── Standard-Recorder (openai REST / local) ───────────────────────────────────
 
 class Recorder:
     def __init__(self):
@@ -124,141 +235,7 @@ class Recorder:
         return np.concatenate(self._frames, axis=0)
 
 
-# ── GPT-Realtime-Whisper Session ──────────────────────────────────────────────
-
-class RealtimeSession:
-    """Öffnet WebSocket beim Tastendruck und streamt Audio live zur API."""
-
-    URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-transcribe"
-
-    def __init__(self, api_key: str, language: str | None = None):
-        self._api_key = api_key
-        self._language = language
-        self._loop = asyncio.new_event_loop()
-        self._ws = None
-        self._stream: sd.InputStream | None = None
-        self._active = False
-        self._connected = threading.Event()
-        self._done = threading.Event()
-        self._transcript: str | None = None
-        self._error: str | None = None
-        self._rms_vals: list[float] = []
-
-    def start(self, device=None) -> bool:
-        """WebSocket öffnen + Audiostream starten."""
-        self._active = True
-        threading.Thread(target=self._run_loop, daemon=True).start()
-
-        if not self._connected.wait(timeout=6):
-            self._error = "Verbindung zur Realtime API Timeout"
-            return False
-        if self._error:
-            return False
-
-        try:
-            self._stream = sd.InputStream(
-                samplerate=REALTIME_SAMPLE_RATE, channels=1, dtype="int16",
-                device=device, callback=self._audio_cb,
-            )
-            self._stream.start()
-            return True
-        except Exception as e:
-            self._error = str(e)
-            return False
-
-    def _audio_cb(self, indata: np.ndarray, frames, t, status):
-        if not self._active:
-            return
-        chunk = indata.copy()
-        self._rms_vals.append(float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))))
-        if self._ws and self._loop:
-            asyncio.run_coroutine_threadsafe(self._send_chunk(chunk), self._loop)
-
-    async def _send_chunk(self, chunk: np.ndarray):
-        try:
-            await self._ws.send(json.dumps({
-                "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(chunk.tobytes()).decode(),
-            }))
-        except Exception:
-            pass
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._ws_session())
-        except Exception as e:
-            self._error = str(e)
-            self._connected.set()
-            self._done.set()
-
-    async def _ws_session(self):
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "OpenAI-Beta": "realtime=v1",
-        }
-        try:
-            async with websockets.connect(
-                self.URL, additional_headers=headers, open_timeout=8,
-            ) as ws:
-                self._ws = ws
-
-                transcription_cfg: dict = {"model": "gpt-4o-transcribe"}
-                if self._language:
-                    transcription_cfg["language"] = self._language
-
-                await ws.send(json.dumps({
-                    "type": "session.update",
-                    "session": {
-                        "input_audio_format": "pcm16",
-                        "input_audio_transcription": transcription_cfg,
-                        "turn_detection": None,
-                        "modalities": ["text"],
-                        "instructions": "Transcribe exactly what is said.",
-                    },
-                }))
-                self._connected.set()
-
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    kind = msg.get("type", "")
-                    if kind == "conversation.item.input_audio_transcription.completed":
-                        self._transcript = msg.get("transcript", "").strip()
-                        self._done.set()
-                        return
-                    elif kind == "error":
-                        self._error = msg.get("error", {}).get("message", "API Fehler")
-                        self._done.set()
-                        return
-        except Exception as e:
-            self._error = str(e)
-            self._connected.set()
-            self._done.set()
-
-    def stop(self) -> tuple[str | None, float]:
-        """Aufnahme stoppen, Buffer committen, auf Transkription warten."""
-        self._active = False
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-
-        avg_rms = float(np.mean(self._rms_vals)) if self._rms_vals else 0.0
-
-        if self._ws and self._loop:
-            asyncio.run_coroutine_threadsafe(
-                self._ws.send(json.dumps({"type": "input_audio_buffer.commit"})),
-                self._loop,
-            )
-
-        self._done.wait(timeout=15)
-
-        if self._error:
-            raise RuntimeError(self._error)
-        return self._transcript, avg_rms
-
-
-# ── Transkriptions-Backends (openai / local) ──────────────────────────────────
+# ── Transkription ─────────────────────────────────────────────────────────────
 
 def transcribe_openai(audio: np.ndarray, cfg: dict) -> str:
     from openai import OpenAI
@@ -288,8 +265,9 @@ def transcribe_local(audio: np.ndarray, cfg: dict) -> str:
         _whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
         print("Modell geladen.")
     audio_f32 = audio.flatten().astype(np.float32) / 32768.0
-    language = cfg.get("WHISPER_LANGUAGE") or None
-    segments, _ = _whisper_model.transcribe(audio_f32, beam_size=5, language=language)
+    segments, _ = _whisper_model.transcribe(
+        audio_f32, beam_size=5, language=cfg.get("WHISPER_LANGUAGE") or None
+    )
     return " ".join(s.text for s in segments).strip()
 
 
@@ -300,9 +278,27 @@ def transcribe(audio: np.ndarray, cfg: dict) -> str:
     return transcribe_local(audio, cfg)
 
 
-# ── LLM-Rewrite (optional) ────────────────────────────────────────────────────
+# ── LLM-Modi ─────────────────────────────────────────────────────────────────
 
-def rewrite_text(text: str, prompt: str, cfg: dict) -> str:
+PROMPTS = {
+    "cleanup": (
+        "Forme diesen diktierten Text in einen klar strukturierten, grammatikalisch "
+        "korrekten Text um. Verbessere Formulierung und Struktur, behalte den Inhalt. "
+        "Antworte nur mit dem verbesserten Text, ohne Erklärungen."
+    ),
+    "calm": (
+        "Schreib diese frustrierte oder emotionale Aussage als ruhige, sachliche "
+        "Nachricht um. Behalte den Kern, entferne Ärger und Emotionen. "
+        "Antworte nur mit der umgeschriebenen Nachricht."
+    ),
+}
+
+
+def llm_rewrite(text: str, mode: str, cfg: dict) -> str:
+    prompt = PROMPTS.get(mode, "")
+    if not prompt:
+        return text
+
     backend = cfg.get("LLM_BACKEND", "openai")
     if backend == "openrouter":
         from openai import OpenAI
@@ -318,9 +314,13 @@ def rewrite_text(text: str, prompt: str, cfg: dict) -> str:
             raise RuntimeError("OPENAI_API_KEY fehlt in .env")
         client = OpenAI(api_key=key)
         model = cfg.get("LLM_MODEL", "gpt-4o-mini")
+
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
         max_tokens=1024,
     )
     return (response.choices[0].message.content or "").strip()
@@ -339,18 +339,24 @@ def notify(title: str, body: str = ""):
 
 
 def is_hallucination(text: str) -> bool:
-    low = text.lower()
-    return any(h in low for h in HALLUCINATIONS)
+    return any(h in text.lower() for h in HALLUCINATIONS)
 
 
-def finish(text: str | None):
-    """Text in Clipboard legen und benachrichtigen."""
+def finish(text: str | None, mode: str, cfg: dict):
     if not text or is_hallucination(text):
         notify("Nichts erkannt", "Bitte nochmal sprechen.")
         return
+    if mode in ("cleanup", "calm"):
+        try:
+            notify(f"{'Blitztext+' if mode == 'cleanup' else 'Blitztext $%&!'} läuft…")
+            text = llm_rewrite(text, mode, cfg)
+        except Exception as e:
+            notify("LLM Fehler", str(e)[:100])
+            return
     to_clipboard(text)
-    notify("Fertig — Strg+V zum Einfügen", text[:120])
-    print(f"→ {text[:80]}")
+    label = {"transcribe": "Blitztext", "cleanup": "Blitztext+", "calm": "Blitztext $%&!"}
+    notify(f"{label.get(mode, 'Fertig')} — Strg+V", text[:120])
+    print(f"→ [{mode}] {text[:80]}")
 
 
 def resolve_input_device(cfg: dict) -> int | None:
@@ -376,42 +382,64 @@ def find_keyboards() -> list[str]:
         real = str(p.resolve())
         try:
             dev = evdev.InputDevice(real)
-            has_rctrl = ecodes.KEY_RIGHTCTRL in dev.capabilities().get(ecodes.EV_KEY, [])
+            caps = dev.capabilities().get(ecodes.EV_KEY, [])
             is_mouse = "mouse" in dev.name.lower()
+            has_keys = ecodes.KEY_RIGHTCTRL in caps or ecodes.KEY_RIGHTALT in caps
             dev.close()
-            if has_rctrl and not is_mouse:
+            if has_keys and not is_mouse:
                 result.append(real)
         except Exception:
             pass
     return result
 
 
-# ── Aufnahme-Handler ──────────────────────────────────────────────────────────
+# ── Handler ───────────────────────────────────────────────────────────────────
 
-def handle_transcription(audio: np.ndarray, cfg: dict):
-    try:
-        text = transcribe(audio, cfg)
-        finish(text)
-    except Exception:
-        print(f"--- FEHLER ---\n{traceback.format_exc()}---")
-        notify("Fehler bei Transkription", traceback.format_exc().splitlines()[-1])
-
-
-def handle_realtime(session: RealtimeSession, cfg: dict):
+def handle_realtime(session: RealtimeSession, mode: str, cfg: dict):
     try:
         text, rms = session.stop()
         threshold = _noise_floor * 2.5
-        print(f"Realtime: RMS={rms:.0f}  Schwelle={threshold:.0f}")
+        print(f"Realtime: RMS={rms:.0f}  Schwelle={threshold:.0f}  Modus={mode}")
         if rms < threshold:
             notify("Zu leise", f"RMS {rms:.0f} / Schwelle {threshold:.0f}")
             return
-        finish(text)
+        finish(text, mode, cfg)
     except Exception:
         print(f"--- FEHLER ---\n{traceback.format_exc()}---")
-        notify("Fehler", traceback.format_exc().splitlines()[-1])
+        notify("Fehler", traceback.format_exc().splitlines()[-1][:100])
+
+
+def handle_transcription(audio: np.ndarray, mode: str, cfg: dict):
+    try:
+        text = transcribe(audio, cfg)
+        finish(text, mode, cfg)
+    except Exception:
+        print(f"--- FEHLER ---\n{traceback.format_exc()}---")
+        notify("Fehler", traceback.format_exc().splitlines()[-1][:100])
 
 
 # ── Tastatur-Listener ─────────────────────────────────────────────────────────
+
+# (code, modifier_key) → Modus wenn Win gleichzeitig gehalten
+COMBOS: dict[frozenset, str] = {
+    frozenset([KEY_WIN, KEY_LCTRL]): "transcribe",
+    frozenset([KEY_WIN, KEY_LALT]):  "calm",
+}
+SINGLE_KEYS: dict[int, str] = {
+    KEY_ALTGR: "cleanup",
+}
+TRIGGER_KEYS = {KEY_WIN, KEY_LCTRL, KEY_LALT, KEY_ALTGR}
+
+
+def detect_mode(keys: set) -> str | None:
+    for combo, mode in COMBOS.items():
+        if combo.issubset(keys):
+            return mode
+    for key, mode in SINGLE_KEYS.items():
+        if key in keys:
+            return mode
+    return None
+
 
 def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
                     stop_event: threading.Event, device=None):
@@ -424,7 +452,9 @@ def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
 
     print(f"Höre auf: {kbd.name}")
     backend = cfg.get("TRANSCRIPTION_BACKEND", "local")
+    keys_held: set[int] = set()
     held = False
+    current_mode: str | None = None
     rt_session: RealtimeSession | None = None
 
     try:
@@ -434,68 +464,77 @@ def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
                 continue
 
             for event in kbd.read():
-                if event.type != ecodes.EV_KEY or event.code != ecodes.KEY_RIGHTCTRL:
+                if event.type != ecodes.EV_KEY:
+                    continue
+                if event.code not in TRIGGER_KEYS:
                     continue
 
-                if event.value == 1 and not held:
-                    held = True
-                    if backend == "realtime":
-                        rt_session = RealtimeSession(
-                            api_key=cfg.get("OPENAI_API_KEY", ""),
-                            language=cfg.get("WHISPER_LANGUAGE") or None,
-                        )
-                        if rt_session.start(device=device):
-                            notify("Streame live…", "Rechte Strg halten und sprechen")
-                        else:
-                            notify("Fehler", rt_session._error or "Verbindung fehlgeschlagen")
-                            rt_session = None
-                            held = False
-                    else:
-                        notify("Aufnahme läuft…", "Rechte Strg halten und sprechen")
-                        recorder.start(device=device)
+                if event.value == 1:  # Taste gedrückt
+                    keys_held.add(event.code)
+                    if not held:
+                        mode = detect_mode(keys_held)
+                        if mode:
+                            held = True
+                            current_mode = mode
+                            if backend == "realtime":
+                                rt_session = RealtimeSession(
+                                    api_key=cfg.get("OPENAI_API_KEY", ""),
+                                    language=cfg.get("WHISPER_LANGUAGE") or None,
+                                )
+                                label = {"transcribe": "Blitztext", "cleanup": "Blitztext+", "calm": "Blitztext $%&!"}
+                                if rt_session.start(device=device):
+                                    notify(f"{label[mode]} — Streame…", "Taste halten und sprechen")
+                                else:
+                                    notify("Fehler", rt_session._error or "Verbindung fehlgeschlagen")
+                                    rt_session = None
+                                    held = False
+                                    current_mode = None
+                            else:
+                                label = {"transcribe": "Blitztext", "cleanup": "Blitztext+", "calm": "Blitztext $%&!"}
+                                notify(f"{label[mode]} — Aufnahme…", "Taste halten und sprechen")
+                                recorder.start(device=device)
 
-                elif event.value == 0 and held:
-                    held = False
+                elif event.value == 0:  # Taste losgelassen
+                    keys_held.discard(event.code)
+                    if held and event.code in TRIGGER_KEYS:
+                        held = False
+                        mode_done = current_mode
+                        current_mode = None
 
-                    if backend == "realtime":
-                        if rt_session:
+                        if backend == "realtime" and rt_session:
                             notify("Warte auf Transkription…")
                             threading.Thread(
                                 target=handle_realtime,
-                                args=(rt_session, cfg),
+                                args=(rt_session, mode_done, cfg),
                                 daemon=True,
                             ).start()
                             rt_session = None
-                    else:
-                        audio = recorder.stop()
-
-                        if audio is None or len(audio) < SAMPLE_RATE // 2:
-                            notify("Zu kurz", "Bitte länger sprechen.")
-                            continue
-
-                        rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-                        threshold = _noise_floor * 2.5
-                        print(f"Aufnahme: RMS={rms:.0f}  Schwelle={threshold:.0f}  Rauschen={_noise_floor:.0f}")
-                        if rms < threshold:
-                            notify("Zu leise", f"RMS {rms:.0f} / Schwelle {threshold:.0f}")
-                            continue
-
-                        pad = np.zeros((SAMPLE_RATE * 3 // 10, 1), dtype=np.int16)
-                        audio = np.concatenate([pad, audio])
-
-                        notify("Transkription läuft…")
-                        threading.Thread(
-                            target=handle_transcription,
-                            args=(audio, cfg),
-                            daemon=True,
-                        ).start()
+                        else:
+                            audio = recorder.stop()
+                            if audio is None or len(audio) < SAMPLE_RATE // 2:
+                                notify("Zu kurz", "Länger sprechen.")
+                                continue
+                            rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+                            threshold = _noise_floor * 2.5
+                            print(f"Aufnahme: RMS={rms:.0f}  Schwelle={threshold:.0f}  Modus={mode_done}")
+                            if rms < threshold:
+                                notify("Zu leise", f"RMS {rms:.0f} / Schwelle {threshold:.0f}")
+                                continue
+                            pad = np.zeros((SAMPLE_RATE * 3 // 10, 1), dtype=np.int16)
+                            audio = np.concatenate([pad, audio])
+                            notify(f"Transkription läuft…")
+                            threading.Thread(
+                                target=handle_transcription,
+                                args=(audio, mode_done, cfg),
+                                daemon=True,
+                            ).start()
     except OSError:
         pass
     finally:
         kbd.close()
 
 
-# ── Tray-Icon (optional) ──────────────────────────────────────────────────────
+# ── Tray-Icon ─────────────────────────────────────────────────────────────────
 
 def try_tray(stop_event: threading.Event) -> bool:
     try:
@@ -534,16 +573,16 @@ def main():
 
     keyboards = find_keyboards()
     if not keyboards:
-        print("Keine Tastatur in /dev/input/by-id/ gefunden.")
+        print("Keine Tastatur gefunden.")
         sys.exit(1)
 
     input_device = resolve_input_device(cfg)
 
     if backend != "realtime":
         global _noise_floor
-        print("Kalibriere Mikrofon-Grundrauschen (1,5 Sek. still sein)…")
+        print("Kalibriere Mikrofon (1,5 Sek. still sein)…")
         _noise_floor = calibrate_noise(input_device)
-        print(f"Grundrauschen: {_noise_floor:.0f} → Sprachschwelle: {_noise_floor * 2.5:.0f}")
+        print(f"Rauschen: {_noise_floor:.0f}  Schwelle: {_noise_floor * 2.5:.0f}")
 
     for kbd in keyboards:
         threading.Thread(
@@ -552,9 +591,11 @@ def main():
             daemon=True,
         ).start()
 
-    print(f"Blitztext gestartet  [Transkription: {backend}]")
-    print("Rechte Strg halten → sprechen → loslassen → Strg+V")
-    print("Beenden: Strg+C")
+    print(f"\nBlitztext gestartet  [Backend: {backend}]")
+    print("  AltGr          → Blitztext+ (Transkription + KI-Cleanup)")
+    print("  Win + Strg L   → Blitztext  (reine Transkription)")
+    print("  Win + Alt L    → Blitztext $%&! (sachlich umformulieren)")
+    print("Beenden: Strg+C\n")
 
     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
