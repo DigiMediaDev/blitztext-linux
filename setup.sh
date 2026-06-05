@@ -14,7 +14,8 @@ sudo apt-get install -y \
     python3-dev \
     libportaudio2 \
     wl-clipboard \
-    libnotify-bin
+    libnotify-bin \
+    ydotool
 
 # input-Gruppe (einmalig)
 if ! groups "$USER" | grep -qw input; then
@@ -45,6 +46,11 @@ if [ "${1}" = "--local" ]; then
 fi
 
 echo "Pakete installiert"
+
+# ydotool Daemon als User-Service aktivieren (Auto-Paste)
+echo ""
+echo "--- ydotool Daemon aktivieren ---"
+systemctl --user enable --now ydotool.service 2>/dev/null && echo "ydotool.service aktiv" || echo "ydotool.service bereits aktiv oder nicht verfügbar"
 
 # .env aus Vorlage anlegen
 if [ ! -f ".env" ]; then
