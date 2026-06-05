@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-blitztext-linux: push-to-talk Diktat für Linux/Wayland
+blitztext-linux: push-to-talk Diktat für Linux
 
 Hotkeys:
-  AltGr          halten → Blitztext+   (Transkription + KI-Cleanup)   ← Standardfall
+  AltGr          halten → Blitztext+   (Transkription + KI-Cleanup)
   Win + Strg L   halten → Blitztext    (reine Transkription)
   Win + Alt L    halten → Blitztext $%&! (sachlich umformulieren)
 
 Backends:
-  TRANSCRIPTION_BACKEND=realtime  → GPT-Realtime-Whisper via OpenAI SDK
-  TRANSCRIPTION_BACKEND=openai    → whisper-1 REST API (Fallback)
-  TRANSCRIPTION_BACKEND=local     → faster-whisper offline
+  TRANSCRIPTION_BACKEND=openai  → whisper-1 REST API (empfohlen)
+  TRANSCRIPTION_BACKEND=local   → faster-whisper offline
 
-Konfiguration via .env (siehe .env Vorlage)
+Konfiguration via .env (siehe .env.example)
 """
 
 import os
@@ -86,13 +85,17 @@ def calibrate_noise(device, seconds: float = 1.5) -> float:
 # ── Realtime Session (OpenAI SDK) ─────────────────────────────────────────────
 
 class RealtimeSession:
-    """Streamt Audio live zur GPT-Realtime-Whisper API via OpenAI SDK."""
+    """
+    Streamt Audio live zur OpenAI Realtime Transcription API (intent=transcription).
+    Audio wird während der Aufnahme übertragen — Ergebnis ist ~0.5s nach Taste-loslassen fertig.
+    """
+
+    WS_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 
     def __init__(self, api_key: str, language: str | None = None):
         self._api_key   = api_key
         self._language  = language
         self._loop      = asyncio.new_event_loop()
-        self._conn      = None
         self._stream    = None
         self._active    = False
         self._connected = threading.Event()
@@ -100,12 +103,13 @@ class RealtimeSession:
         self._transcript: str | None = None
         self._error: str | None = None
         self._rms_vals: list[float] = []
+        self._send_queue: asyncio.Queue | None = None
 
     def start(self, device=None) -> bool:
         self._active = True
         threading.Thread(target=self._run_loop, daemon=True).start()
-        if not self._connected.wait(timeout=8):
-            self._error = "Verbindungs-Timeout zur Realtime API"
+        if not self._connected.wait(timeout=10):
+            self._error = "Verbindungs-Timeout zur Transcription API"
             return False
         if self._error:
             return False
@@ -121,61 +125,86 @@ class RealtimeSession:
             return False
 
     def _audio_cb(self, indata: np.ndarray, frames, t, status):
-        if not self._active:
+        if not self._active or self._send_queue is None:
             return
         chunk = indata.copy()
         self._rms_vals.append(float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))))
-        if self._conn and self._loop:
-            asyncio.run_coroutine_threadsafe(self._send_chunk(chunk), self._loop)
-
-    async def _send_chunk(self, chunk: np.ndarray):
-        try:
-            await self._conn.input_audio_buffer.append(
-                audio=base64.b64encode(chunk.tobytes()).decode()
-            )
-        except Exception:
-            pass
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(chunk.tobytes()), self._loop
+        )
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
         try:
-            self._loop.run_until_complete(self._sdk_session())
+            self._loop.run_until_complete(self._ws_session())
         except Exception as e:
             self._error = str(e)
-            print(f"Realtime Verbindungsfehler: {e}")
+            print(f"Streaming Transcription Fehler: {e}")
             self._connected.set()
             self._done.set()
 
-    async def _sdk_session(self):
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=self._api_key)
-        transcription_cfg: dict = {"model": "whisper-1"}
+    async def _ws_session(self):
+        import json
+        from websockets.asyncio.client import connect
+
+        self._send_queue = asyncio.Queue()
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+        }
+        transcription_cfg: dict = {"model": "gpt-4o-mini-transcribe"}
         if self._language:
             transcription_cfg["language"] = self._language
+
         try:
-            async with client.beta.realtime.connect(
-                model="gpt-4o-realtime-preview"
-            ) as conn:
-                self._conn = conn
-                await conn.session.update(session={
-                    "modalities": ["text"],
-                    "input_audio_transcription": transcription_cfg,
-                    "turn_detection": None,
-                })
-                self._connected.set()
-                async for event in conn:
-                    kind = event.type
-                    if kind == "conversation.item.input_audio_transcription.completed":
-                        self._transcript = event.transcript.strip()
-                        self._done.set()
-                        return
-                    elif kind == "error":
-                        self._error = str(getattr(event, "error", event))
-                        print(f"Realtime Fehler: {self._error}")
-                        self._done.set()
-                        return
+            async with connect(self.WS_URL, additional_headers=headers) as ws:
+                await ws.send(json.dumps({
+                    "type": "session.update",
+                    "session": {
+                        "modalities": ["text"],
+                        "input_audio_format": "pcm16",
+                        "input_audio_transcription": transcription_cfg,
+                        "turn_detection": None,
+                    },
+                }))
+
+                async def recv_loop():
+                    async for message in ws:
+                        event = json.loads(message)
+                        t = event.get("type", "")
+                        if t in ("session.created", "session.updated"):
+                            self._connected.set()
+                        elif t == "conversation.item.input_audio_transcription.completed":
+                            self._transcript = event.get("transcript", "").strip()
+                            self._done.set()
+                            return
+                        elif t == "error":
+                            self._error = str(event.get("error", event))
+                            print(f"Transcription API Fehler: {self._error}")
+                            self._connected.set()
+                            self._done.set()
+                            return
+
+                recv_task = asyncio.create_task(recv_loop())
+
+                while True:
+                    chunk = await self._send_queue.get()
+                    if chunk is None:
+                        break
+                    await ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode(),
+                    }))
+
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                await asyncio.wait_for(recv_task, timeout=15)
+
+        except asyncio.TimeoutError:
+            self._error = "Timeout beim Warten auf Transkription"
+            self._connected.set()
+            self._done.set()
         except Exception as e:
             self._error = str(e)
+            print(f"Streaming Verbindungsfehler: {e}")
             self._connected.set()
             self._done.set()
 
@@ -186,9 +215,9 @@ class RealtimeSession:
             self._stream.close()
             self._stream = None
         avg_rms = float(np.mean(self._rms_vals)) if self._rms_vals else 0.0
-        if self._conn and self._loop:
+        if self._send_queue and self._loop:
             asyncio.run_coroutine_threadsafe(
-                self._conn.input_audio_buffer.commit(), self._loop
+                self._send_queue.put(None), self._loop
             )
         self._done.wait(timeout=15)
         if self._error:
@@ -247,7 +276,7 @@ def transcribe_openai(audio: np.ndarray, cfg: dict) -> str:
         wavfile.write(tmp.name, SAMPLE_RATE, audio)
         with open(tmp.name, "rb") as f:
             result = client.audio.transcriptions.create(
-                model="whisper-1", file=f, response_format="text",
+                model="gpt-4o-mini-transcribe", file=f, response_format="text",
                 language=cfg.get("WHISPER_LANGUAGE") or None,
             )
         return str(result).strip()
@@ -325,6 +354,15 @@ def to_clipboard(text: str):
     proc.stdin.close()
 
 
+def auto_paste():
+    # Ctrl+V via ydotool (GNOME Wayland) — requires ydotoold daemon
+    time.sleep(0.15)
+    subprocess.run(
+        ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+        check=False, capture_output=True,
+    )
+
+
 def notify(title: str, body: str = ""):
     subprocess.run(["notify-send", "-t", "4000", title, body], check=False)
 
@@ -345,8 +383,9 @@ def finish(text: str | None, mode: str, cfg: dict):
             notify("LLM Fehler", str(e)[:100])
             return
     to_clipboard(text)
+    auto_paste()
     label = {"transcribe": "Blitztext", "cleanup": "Blitztext+", "calm": "Blitztext $%&!"}
-    notify(f"{label.get(mode, 'Fertig')} — Strg+V", text[:120])
+    notify(f"{label.get(mode, 'Fertig')}", text[:120])
     print(f"→ [{mode}] {text[:80]}")
 
 
