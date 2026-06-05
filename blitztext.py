@@ -142,6 +142,7 @@ class RealtimeSession:
             self._loop.run_until_complete(self._sdk_session())
         except Exception as e:
             self._error = str(e)
+            print(f"Realtime Verbindungsfehler: {e}")
             self._connected.set()
             self._done.set()
 
@@ -157,11 +158,9 @@ class RealtimeSession:
             ) as conn:
                 self._conn = conn
                 await conn.session.update(session={
-                    "input_audio_format": "pcm16",
+                    "modalities": ["text"],
                     "input_audio_transcription": transcription_cfg,
                     "turn_detection": None,
-                    "modalities": ["text"],
-                    "instructions": "Transcribe exactly what is said.",
                 })
                 self._connected.set()
                 async for event in conn:
@@ -282,9 +281,10 @@ def transcribe(audio: np.ndarray, cfg: dict) -> str:
 
 PROMPTS = {
     "cleanup": (
-        "Forme diesen diktierten Text in einen klar strukturierten, grammatikalisch "
-        "korrekten Text um. Verbessere Formulierung und Struktur, behalte den Inhalt. "
-        "Antworte nur mit dem verbesserten Text, ohne Erklärungen."
+        "Bereinige diesen diktierten Text: Korrigiere Grammatik, entferne Versprecher, "
+        "Wiederholungen und Füllwörter. Behalte exakt den Inhalt und die Aussagen des "
+        "Originals — füge nichts hinzu, lasse nichts weg. "
+        "Antworte nur mit dem bereinigten Text."
     ),
     "calm": (
         "Schreib diese frustrierte oder emotionale Aussage als ruhige, sachliche "
@@ -299,21 +299,12 @@ def llm_rewrite(text: str, mode: str, cfg: dict) -> str:
     if not prompt:
         return text
 
-    backend = cfg.get("LLM_BACKEND", "openai")
-    if backend == "openrouter":
-        from openai import OpenAI
-        key = cfg.get("OPENROUTER_API_KEY", "")
-        if not key:
-            raise RuntimeError("OPENROUTER_API_KEY fehlt in .env")
-        client = OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1")
-        model = cfg.get("LLM_MODEL", "openai/gpt-4o-mini")
-    else:
-        from openai import OpenAI
-        key = cfg.get("OPENAI_API_KEY", "")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY fehlt in .env")
-        client = OpenAI(api_key=key)
-        model = cfg.get("LLM_MODEL", "gpt-4o-mini")
+    from openai import OpenAI
+    key = cfg.get("OPENAI_API_KEY", "")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY fehlt in .env")
+    client = OpenAI(api_key=key)
+    model = cfg.get("LLM_MODEL", "gpt-4o-mini")
 
     response = client.chat.completions.create(
         model=model,
