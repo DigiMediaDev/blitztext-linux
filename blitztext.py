@@ -363,8 +363,21 @@ def auto_paste():
     )
 
 
-def notify(title: str, body: str = ""):
-    subprocess.run(["notify-send", "-t", "4000", title, body], check=False)
+_notify_id: int = 0
+
+
+def notify(title: str, body: str = "", timeout_ms: int = 4000):
+    global _notify_id
+    cmd = ["notify-send", "--print-id", "-t", str(timeout_ms), title]
+    if body:
+        cmd.append(body)
+    if _notify_id:
+        cmd += ["--replace-id", str(_notify_id)]
+    result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    try:
+        _notify_id = int(result.stdout.strip())
+    except (ValueError, AttributeError):
+        pass
 
 
 def is_hallucination(text: str) -> bool:
@@ -513,7 +526,7 @@ def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
                                 )
                                 label = {"transcribe": "Blitztext", "cleanup": "Blitztext+", "calm": "Blitztext $%&!"}
                                 if rt_session.start(device=device):
-                                    notify(f"{label[mode]} — Streame…", "Taste halten und sprechen")
+                                    notify(f"{label[mode]} — Streame…", "Taste halten und sprechen", timeout_ms=60000)
                                 else:
                                     notify("Fehler", rt_session._error or "Verbindung fehlgeschlagen")
                                     rt_session = None
@@ -521,7 +534,7 @@ def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
                                     current_mode = None
                             else:
                                 label = {"transcribe": "Blitztext", "cleanup": "Blitztext+", "calm": "Blitztext $%&!"}
-                                notify(f"{label[mode]} — Aufnahme…", "Taste halten und sprechen")
+                                notify(f"{label[mode]} — Aufnahme…", "Taste halten und sprechen", timeout_ms=60000)
                                 recorder.start(device=device)
 
                 elif event.value == 0:  # Taste losgelassen
