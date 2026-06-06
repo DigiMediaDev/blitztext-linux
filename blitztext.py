@@ -493,7 +493,9 @@ def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
         stop_event.set()
         return
 
-    print(f"Höre auf: {kbd.name}")
+    mic_name = sd.query_devices(device)["name"] if device is not None else sd.query_devices(kind="input")["name"]
+    print(f"Tastatur:  {kbd.name}")
+    print(f"Mikrofon:  {mic_name}")
     backend = cfg.get("TRANSCRIPTION_BACKEND", "local")
     keys_held: set[int] = set()
     held = False
