@@ -441,7 +441,7 @@ def find_keyboards() -> list[str]:
 def handle_realtime(session: RealtimeSession, mode: str, cfg: dict):
     try:
         text, rms = session.stop()
-        threshold = _noise_floor * 2.5
+        threshold = min(_noise_floor * 1.4, 4000)
         print(f"Realtime: RMS={rms:.0f}  Schwelle={threshold:.0f}  Modus={mode}")
         if rms < threshold:
             notify("Zu leise", f"RMS {rms:.0f} / Schwelle {threshold:.0f}")
@@ -558,11 +558,12 @@ def listen_keyboard(kbd_path: str, recorder: Recorder, cfg: dict,
                                 notify("Zu kurz", "Länger sprechen.")
                                 continue
                             rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
-                            threshold = _noise_floor * 2.5
+                            threshold = min(_noise_floor * 1.4, 4000)
                             print(f"Aufnahme: RMS={rms:.0f}  Schwelle={threshold:.0f}  Modus={mode_done}")
                             if rms < threshold:
                                 notify("Zu leise", f"RMS {rms:.0f} / Schwelle {threshold:.0f}")
                                 continue
+                            audio = np.clip(audio.astype(np.float32) * 3, -32768, 32767).astype(np.int16)
                             pad = np.zeros((SAMPLE_RATE * 3 // 10, 1), dtype=np.int16)
                             audio = np.concatenate([pad, audio])
                             notify(f"Transkription läuft…")
@@ -625,7 +626,7 @@ def main():
         global _noise_floor
         print("Kalibriere Mikrofon (1,5 Sek. still sein)…")
         _noise_floor = calibrate_noise(input_device)
-        print(f"Rauschen: {_noise_floor:.0f}  Schwelle: {_noise_floor * 2.5:.0f}")
+        print(f"Rauschen: {_noise_floor:.0f}  Schwelle: {_noise_floor * 1.4:.0f}")
 
     for kbd in keyboards:
         threading.Thread(
